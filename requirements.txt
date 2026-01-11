@@ -1,0 +1,8 @@
+mediapipe
+opencv-python
+pyautogui
+pynput
+numpy
+PySide6
+autopep8
+flake8
