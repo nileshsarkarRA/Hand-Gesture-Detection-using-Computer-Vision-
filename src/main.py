@@ -47,7 +47,7 @@ def draw_landmarks(image, landmarks, color=(0, 255, 120)):
 
 def main():
     """
-    AuraHand - High-accuracy Hand Gesture OS Control.
+    GestureFlow - High-accuracy Hand Gesture OS Control.
     Refactored for performance and modularity.
     """
     # Validate configuration
@@ -97,7 +97,7 @@ def main():
     fps = 0
     
     logger.info("="*50)
-    logger.info("  AURAHAND: GESTURE CONTROL OS")
+    logger.info("  GESTUREFLOW: GESTURE CONTROL OS")
     logger.info("="*50)
     logger.info("Press [V] to toggle video feed")
     logger.info("Press [Q] to quit safely")
@@ -136,8 +136,9 @@ def main():
                         left_lm = lm_list
 
             # Analyze gestures and execute OS commands
+            # Pass raw_frame for lighting analysis during calibration
             # engine.process_gestures returns a tuple (main_text, sub_text, color, progress)
-            t1, t2, col, prog = engine.process_gestures(right_lm, left_lm)
+            t1, t2, col, prog = engine.process_gestures(right_lm, left_lm, raw_frame)
             
             # Build Dashboard Output
             if not show_video:
@@ -164,7 +165,7 @@ def main():
             HUD.render_island(disp, t1, t2, col, progress=prog, fps=fps, show_video=show_video)
             
             # Display the result
-            cv2.imshow("AuraHand HUD", disp)
+            cv2.imshow("GestureFlow HUD", disp)
             
             # Check for keyboard interruptions
             key = cv2.waitKey(1) & 0xFF
@@ -181,7 +182,7 @@ def main():
         logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
     finally:
         # Cleanup
-        logger.info("Shutting down AuraHand...")
+        logger.info("Shutting down GestureFlow...")
         try:
             cam.release()
         except Exception as e:

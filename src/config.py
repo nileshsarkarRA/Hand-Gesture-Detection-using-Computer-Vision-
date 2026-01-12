@@ -2,7 +2,7 @@ import cv2
 import pyautogui
 
 class Config:
-    """Central configuration for AuraHand system.
+    """Central configuration for GestureFlow system.
     
     All parameters are tuned for laptop/integrated webcam scenarios.
     Adjust these values based on your hardware and preferences.
@@ -13,17 +13,18 @@ class Config:
     HEIGHT = 480
     FPS = 30  # Reduced from 60 for better stability on lower-end hardware
     
-    # --- Tracking & Sensitivity ---
+    # --- Tracking & Sensitivity (Optimized for better detection) ---
     TRACKING_SCALE = 1.6         # Cursor speed multiplier (>1.0 = faster)
     SMOOTHING_BETA = 0.05        # Filter responsiveness (lower = smoother)
     CLICK_COOLDOWN = 0.35        # Debounce time between clicks (seconds)
-    PINCH_THRESH = 0.05          # Distance threshold for pinch detection (0.0-1.0)
+    PINCH_THRESH = 0.06          # Distance threshold for pinch detection (relaxed for better detection)
+    PINCH_HOLD_TIME = 0.08       # Time to hold pinch for click confirmation (reduced from 0.15s)
     ZOOM_STEP = 0.03             # Minimum hand distance change to trigger zoom
-    SCROLL_SPEED = 500            # Pixels per second when scrolling
+    SCROLL_SPEED = 500           # Pixels per second when scrolling
     
-    # --- Calibration ---
-    CALIB_TIME = 2.0              # Duration to hold hand steady (seconds)
-    CALIB_DRIFT_MAX = 0.05        # Max hand drift during calibration (normalized)
+    # --- Calibration (Enhanced Mode) ---
+    CALIB_TIME = 2.5              # Duration to hold hand steady (seconds) - reduced
+    CALIB_DRIFT_MAX = 0.05        # Max hand drift during calibration (normalized) - relaxed for natural tremor
     
     # --- UI Theme (BGR format) ---
     UI_BG = (15, 15, 15)          # Dark background
