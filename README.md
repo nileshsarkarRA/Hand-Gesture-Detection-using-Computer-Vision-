@@ -290,26 +290,26 @@ If download fails, manually download from [MediaPipe Models](https://developers.
 
 ## 🤝 Contributing
 
-Contributions are welcome! Whether it's bug fixes, new gestures, or performance improvements:
+> [!NOTE]
+> **Project Status:** This repository contains the **production-ready MediaPipe implementation** of GestureFlow, optimized for Windows 10/11. This version is feature-complete and stable.
+
+### Current Repository
+This codebase represents the best implementation using existing MediaPipe technology. Bug fixes and minor improvements are welcome:
 
 1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-gesture`)
-3. Commit your changes (`git commit -m 'Add some amazing gesture'`)
-4. Push to the branch (`git push origin feature/amazing-gesture`)
+2. Create a bugfix branch (`git checkout -b fix/issue-description`)
+3. Commit your changes (`git commit -m 'Fix: description'`)
+4. Push to the branch (`git push origin fix/issue-description`)
 5. Open a Pull Request
 
-### Development Setup
+### Future Development
+For **new features, custom gestures, and ML model improvements**, please wait for the upcoming **GestureFlow-ML** repository, which will feature:
+- Custom CNN/DL model architecture
+- Raspberry Pi 5 optimization
+- Advanced gesture customization
+- Community-driven model training
 
-```bash
-# Install development dependencies
-pip install autopep8 flake8
-
-# Run code formatter
-autopep8 --in-place --recursive src/
-
-# Run linter
-flake8 src/
-```
+Stay tuned for the GestureFlow-ML repository announcement!
 
 ---
 
