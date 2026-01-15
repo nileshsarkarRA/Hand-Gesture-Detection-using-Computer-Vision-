@@ -6,69 +6,92 @@ import time
 import math
 import threading
 import platform
-# from controller import Controller  # Logic now moved into internal Controller class
-
-
+from collections import deque
 
 # ==============================================================================
-#                               CONFIG & SETTINGS
+#                           SYSTEM CONFIGURATION
 # ==============================================================================
 class Config:
-    # Camera
-    WIDTH = 640
-    HEIGHT = 480
-    FPS = 60
+    # Camera Settings
+    CAM_WIDTH, CAM_HEIGHT = 640, 480
+    FPS = 80
     
-    # Sensitivity
-    TRACKING_SCALE = 1.5    # Acceleration factor
-    CLICK_COOLDOWN = 0.4
-    SCROLL_SPEED = 40
-    ZOOM_STEP = 0.04
+    # Screen Settings
+    SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
     
-    # Physics
-    SMOOTHING = 0.02      # Lower = Smoother, Higher = Snappier
+    # Smoothing & Filtering (OneEuroFilter parameters)
+    # Beta: Higher = less lag, more jitter. Lower = smoother, more lag.
+    # MinCutoff: Low speed jitter filter.
+    ONE_EURO_BETA = 2.0         # Increased base speed
+    ONE_EURO_MIN_CUTOFF = 0.8 
     
-    # Gestures
-    PINCH_THRESH = 0.06
-    FIST_THRESH = 0.4
+    # --- NEW: ROTATION CORRECTION ---
+    # Rotates the coordinate system to match natural hand tilt.
+    # If your hand moves "up" but the cursor moves "up-right", adjust this.
+    # Positive = Clockwise, Negative = Counter-Clockwise.
+    TILT_ANGLE_DEG = -20  # Compensates for natural arm angle
     
-    # Calibration (THE FIX IS HERE)
-    CALIB_TIME = 2.0
-    CALIB_DIST = 50       # Max pixel movement allowed during calibration
+    # Interaction Area (The "Virtual Trackpad")
+    ROI_SCALE = 0.65  # Slightly tighter box for less arm movement
     
-    # UI
-    UI_BG = (10, 10, 10)
-    UI_ACCENT = (0, 255, 120)
-    UI_WARN = (0, 100, 255)
-    UI_INFO = (255, 132, 10)
-    UI_TEXT = (220, 220, 220)
-    FONT = cv2.FONT_HERSHEY_SIMPLEX
+    # Hysteresis Thresholds (Schmitt Trigger for clicks)
+    PINCH_DOWN_THRESH = 0.035  # Trigger click
+    PINCH_UP_THRESH = 0.050    # Release click
     
+    # --- NEW: PRECISION STABILIZATION ---
+    # When fingers are this close, we dampen movement to help select small items.
+    PINCH_STABILIZE_DIST = 0.08 
+    STABILIZE_FACTOR = 0.2  # Multiplier for speed when stabilizing (0.2 = 5x slower)
+    
+    # Scroll Physics
+    SCROLL_SENSITIVITY = 10
+    SCROLL_DEADZONE = 0.02
+    
+    # Timings
+    DOUBLE_CLICK_TIMEOUT = 0.25
+    DRAG_ACTIVATION_TIME = 0.3
+
+    # Visuals
+    COLOR_POINTER = (0, 255, 120)  # Neon Green
+    COLOR_CLICK = (0, 100, 255)    # Orange
+    COLOR_SCROLL = (255, 0, 255)   # Magenta
+
+    # PyAutoGUI Optimization
     pyautogui.PAUSE = 0
     pyautogui.FAILSAFE = False
 
+
 # ==============================================================================
-#                           1. THREADED CAMERA
+#                       1. LOW-LATENCY CAMERA THREAD
 # ==============================================================================
 class ThreadedCamera:
+    """
+    Decouples frame capture from processing logic. 
+    Ensures the CV2 buffer never fills up, reducing latency to strictly 1 frame.
+    """
     def __init__(self, src=0):
         self.cap = cv2.VideoCapture(src)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, Config.WIDTH)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, Config.HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, Config.CAM_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, Config.CAM_HEIGHT)
         self.cap.set(cv2.CAP_PROP_FPS, Config.FPS)
+        
+        # Hardware optimization for some backends
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
         self.success, self.frame = self.cap.read()
         self.stopped = False
         self.lock = threading.Lock()
 
     def start(self):
-        threading.Thread(target=self.update, args=(), daemon=True).start()
+        t = threading.Thread(target=self.update, args=(), daemon=True)
+        t.start()
         return self
 
     def update(self):
         while not self.stopped:
             success, frame = self.cap.read()
             if success:
+                # We only keep the latest frame
                 with self.lock:
                     self.success = success
                     self.frame = frame
@@ -83,11 +106,17 @@ class ThreadedCamera:
         self.stopped = True
         self.cap.release()
 
+
 # ==============================================================================
-#                           2. ONE EURO FILTER
+#                       2. SIGNAL PROCESSING (SMOOTHING)
 # ==============================================================================
 class OneEuroFilter:
-    def __init__(self, freq=60, mincutoff=1.0, beta=0.05, dcutoff=1.0):
+    """
+    Standard Human-Computer Interaction filter. 
+    Filters out high-frequency noise (jitter) while maintaining low latency 
+    during high-speed movement.
+    """
+    def __init__(self, freq=60, mincutoff=1.0, beta=0.0, dcutoff=1.0):
         self.freq = float(freq)
         self.mincutoff = float(mincutoff)
         self.beta = float(beta)
@@ -100,656 +129,320 @@ class OneEuroFilter:
         tau = 1.0 / (2 * math.pi * cutoff)
         return 1.0 / (1.0 + tau / dt)
 
-    def filter(self, x):
+    def filter(self, x, custom_beta=None):
         now = time.time()
         if self.last_time is None:
             self.last_time = now
             self.x_prev = x
             self.dx_prev = 0.0
             return x
+            
         dt = now - self.last_time
-        if dt <= 0: return x
+        if dt <= 0: return x  # Avoid division by zero
         
+        # Estimate derivative (velocity)
         dx = (x - self.x_prev) / dt
-        alpha_d = self.alpha(self.dcutoff, dt)
-        dx_hat = alpha_d * dx + (1 - alpha_d) * self.dx_prev
+        edx = self.alpha(self.dcutoff, dt) * dx + (1 - self.alpha(self.dcutoff, dt)) * self.dx_prev
         
-        cutoff = self.mincutoff + self.beta * abs(dx_hat)
-        alpha_x = self.alpha(cutoff, dt)
-        x_hat = alpha_x * x + (1 - alpha_x) * self.x_prev
+        # Adjust cutoff frequency based on velocity
+        # High velocity -> High cutoff (less lag)
+        # Low velocity -> Low cutoff (less jitter)
+        # Allow dynamic beta override for "Sniper Mode"
+        beta = custom_beta if custom_beta is not None else self.beta
+        
+        cutoff = self.mincutoff + beta * abs(edx)
+        alpha = self.alpha(cutoff, dt)
+        
+        x_hat = alpha * x + (1 - alpha) * self.x_prev
         
         self.x_prev = x_hat
-        self.dx_prev = dx_hat
+        self.dx_prev = edx
+        self.last_time = now
         return x_hat
 
 
 # ==============================================================================
-#                           3.5 CONTROLLER LOGIC (FIXED)
+#                       3. GEOMETRY & MAPPING ENGINE
 # ==============================================================================
-class Controller:
-    """Self-contained Controller for hand gesture handling."""
-    l_hand = None
-    r_hand = None
-    r_filters = [OneEuroFilter(beta=Config.SMOOTHING) for _ in range(2)]
-    prev_zoom_dist = None
-    last_click_time = 0
-    is_dragging = False
-    
-    # OS Support
-    OS_CMD = 'command' if platform.system() == 'Darwin' else 'ctrl'
-    
-    # CLICK LOCK: Stabilizes cursor by freezing it when a pinch is detected
-    click_lock_start = 0
-    CLICK_LOCK_DURATION = 0.35  # Slightly longer for better stabilization
-    last_pinch_state = False
-    
-    # Window Navigation
-    last_swipe_time = 0
-    SWIPE_COOLDOWN = 0.8
-
-    @classmethod
-    def set_hands(cls, left, right):
-        cls.l_hand = left
-        cls.r_hand = right
-
-    @classmethod
-    def update_right_hand_status(cls):
-        pass # Placeholder for external tracking if needed
-
-    @classmethod
-    def update_left_hand_status(cls):
-        pass # Placeholder for external tracking if needed
-
-    @classmethod
-    def get_dist(cls, p1, p2):
+class GeometryEngine:
+    @staticmethod
+    def get_distance(p1, p2):
         return math.hypot(p1.x - p2.x, p1.y - p2.y)
 
-    @classmethod
-    def cursor_moving(cls):
-        if not cls.r_hand: return
-        
-        # Click-Lock: Don't move cursor if we just clicked (stabilize)
-        if time.time() - cls.click_lock_start < cls.CLICK_LOCK_DURATION:
-            return
-
-        # Use Middle Finger Knuckle (9) for stable tracking
-        node = cls.r_hand.landmark[9]
-        scr_w, scr_h = pyautogui.size()
-        
-        # Scaling and padding
-        margin = 0.15
-        x = (node.x - margin) / (1 - 2*margin)
-        y = (node.y - margin) / (1 - 2*margin)
-        x = max(0, min(1, x))
-        y = max(0, min(1, y))
-        
-        # Acceleration
-        x = (x - 0.5) * Config.TRACKING_SCALE + 0.5
-        y = (y - 0.5) * Config.TRACKING_SCALE + 0.5
-        x = max(0, min(1, x))
-        y = max(0, min(1, y))
-
-        fx = cls.r_filters[0].filter(x * scr_w)
-        fy = cls.r_filters[1].filter(y * scr_h)
-        pyautogui.moveTo(fx, fy, duration=0)
-
-    @classmethod
-    def detect_clicking(cls):
-        if not cls.r_hand: return
-        now = time.time()
-        if now - cls.last_click_time < Config.CLICK_COOLDOWN: return
-
-        thumb = cls.r_hand.landmark[4]
-        index = cls.r_hand.landmark[8]
-        middle = cls.r_hand.landmark[12]
-        pinky = cls.r_hand.landmark[20]
-
-        # Left Click (Index + Thumb pinch)
-        if cls.get_dist(thumb, index) < Config.PINCH_THRESH:
-            if not cls.last_pinch_state:
-                pyautogui.click()
-                cls.last_click_time = now
-                cls.click_lock_start = now # Start Click-Lock
-            cls.last_pinch_state = True
-        # Right Click (Middle + Thumb pinch)
-        elif cls.get_dist(thumb, middle) < Config.PINCH_THRESH:
-            if not cls.last_pinch_state:
-                pyautogui.rightClick()
-                cls.last_click_time = now
-                cls.click_lock_start = now # Start Click-Lock
-            cls.last_pinch_state = True
-        else:
-            cls.last_pinch_state = False
-
-        # Double Click Protection (Optional - user mentioned thumb displacement)
-        # We handle this via the pinch logic above.
-        fingers_up = 0
-        for i in [8, 12, 16, 20]:
-            if cls.r_hand.landmark[i].y < cls.r_hand.landmark[i-2].y:
-                fingers_up += 1
-        
-        if fingers_up == 0 and not cls.is_dragging:
-            pyautogui.mouseDown()
-            cls.is_dragging = True
-        elif fingers_up > 1 and cls.is_dragging:
-            pyautogui.mouseUp()
-            cls.is_dragging = False
-
-    @classmethod
-    def detect_zooming(cls):
-        if not (cls.l_hand and cls.r_hand):
-            cls.prev_zoom_dist = None
-            return
-        
-        dist = cls.get_dist(cls.l_hand.landmark[9], cls.r_hand.landmark[9])
-        if cls.prev_zoom_dist is None:
-            cls.prev_zoom_dist = dist
-            return
-
-        delta = dist - cls.prev_zoom_dist
-        if abs(delta) > Config.ZOOM_STEP:
-            if delta > 0: pyautogui.hotkey(cls.OS_CMD, '=')
-            else: pyautogui.hotkey(cls.OS_CMD, '-')
-            cls.prev_zoom_dist = dist
-
-    @classmethod
-    def detect_scrolling(cls):
-        if not (cls.l_hand and cls.r_hand): return
-        # Left hand fist = Scroll Mode
-        l_fingers_up = sum([1 for i in [8,12,16,20] if cls.l_hand.landmark[i].y < cls.l_hand.landmark[i-2].y])
-        if l_fingers_up == 0:
-            # Use right hand vertical movement to scroll
-            node = cls.r_hand.landmark[9]
-            if hasattr(cls, 'prev_sc_y') and cls.prev_sc_y is not None:
-                dy = cls.prev_sc_y - node.y
-                if abs(dy) > 0.01:
-                    pyautogui.scroll(int(dy * 1000))
-            cls.prev_sc_y = node.y
-        else:
-            cls.prev_sc_y = None
-
-    @classmethod
-    def detect_swipe_gesture(cls):
-        """Window Navigation (App Switcher) using Left Hand swipe."""
-        if not cls.l_hand: return
-        now = time.time()
-        if now - cls.last_swipe_time < cls.SWIPE_COOLDOWN: return
-
-        # Use index finger tip velocity for swipe
-        tip = cls.l_hand.landmark[8]
-        if hasattr(cls, 'prev_l_tip'):
-            dx = tip.x - cls.prev_l_tip.x
-            # Fast horizontal move detected
-            if abs(dx) > 0.08:
-                if dx > 0: # Swipe Right
-                    pyautogui.hotkey(cls.OS_CMD, 'tab')
-                else: # Swipe Left
-                    pyautogui.hotkey(cls.OS_CMD, 'shift', 'tab')
-                cls.last_swipe_time = now
-        cls.prev_l_tip = tip
-class DynamicIsland:
     @staticmethod
-    def render(img, main, sub, color, progress=0.0, fps=0, show_video=True):
-        h, w = img.shape[:2]
-        iw, ih = 420, 80
-        ix = (w - iw) // 2
-        iy = 20
+    def rotate_point(x, y, degrees, cx=0.5, cy=0.5):
+        """
+        Rotates a point (x, y) around a center (cx, cy) by 'degrees'.
+        Used to align the hand's natural movement axis with the screen.
+        """
+        rads = math.radians(degrees)
+        cos_a = math.cos(rads)
+        sin_a = math.sin(rads)
         
-        overlay = img.copy()
-        cv2.rectangle(overlay, (ix+20, iy), (ix+iw-20, iy+ih), Config.UI_BG, -1)
-        cv2.circle(overlay, (ix+20, iy+ih//2), ih//2, Config.UI_BG, -1)
-        cv2.circle(overlay, (ix+iw-20, iy+ih//2), ih//2, Config.UI_BG, -1)
+        # Translate to origin
+        tx = x - cx
+        ty = y - cy
         
-        alpha = 0.85 if show_video else 1.0
-        cv2.addWeighted(overlay, alpha, img, 1-alpha, 0, img)
+        # Rotate
+        rx = tx * cos_a - ty * sin_a
+        ry = tx * sin_a + ty * cos_a
         
-        if progress > 0:
-            pw = int((iw - 60) * progress)
-            cv2.line(img, (ix+30, iy+ih-5), (ix+30+pw, iy+ih-5), color, 4)
+        # Translate back
+        return rx + cx, ry + cy
 
-        cv2.circle(img, (ix+40, iy+ih//2), 8, color, -1)
-        cv2.putText(img, main, (ix+70, iy+35), Config.FONT, 0.7, Config.UI_TEXT, 1, cv2.LINE_AA)
-        cv2.putText(img, sub, (ix+70, iy+65), Config.FONT, 0.5, (160,160,160), 1, cv2.LINE_AA)
-        cv2.putText(img, f"{int(fps)}", (ix+iw-40, iy+45), Config.FONT, 0.6, (80,80,80), 1)
+    @staticmethod
+    def map_coordinates(norm_x, norm_y, tilt_angle=0):
+        """
+        Maps normalized coordinates (0-1) from the camera ROI to screen pixels.
+        Includes rotation correction and aspect ratio correction.
+        """
+        # 0. Apply Rotation Correction (New Feature)
+        rot_x, rot_y = GeometryEngine.rotate_point(norm_x, norm_y, tilt_angle)
+        
+        # 1. Define ROI (Region of Interest) centered in frame
+        # We want an ROI that matches the screen aspect ratio (e.g., 16:9)
+        screen_aspect = Config.SCREEN_WIDTH / Config.SCREEN_HEIGHT
+        
+        roi_w = Config.ROI_SCALE
+        roi_h = roi_w * (Config.CAM_WIDTH / Config.CAM_HEIGHT) / screen_aspect
+        
+        # 2. Normalize input relative to ROI
+        roi_x_start = (1 - roi_w) / 2
+        roi_y_start = (1 - roi_h) / 2
+        
+        # Clamp and map
+        safe_x = max(0, min(1, (rot_x - roi_x_start) / roi_w))
+        safe_y = max(0, min(1, (rot_y - roi_y_start) / roi_h))
+        
+        # 3. Mouse Acceleration Curve (Non-linear mapping)
+        # This makes small movements smaller (precision) and fast movements larger
+        # Using a simple power curve: x^1.2
+        # curve_x = pow(safe_x, 1.0) # Linear for now, let OneEuro handle smoothing
+        # curve_y = pow(safe_y, 1.0)
+        
+        # 4. Scale to screen
+        screen_x = safe_x * Config.SCREEN_WIDTH
+        screen_y = safe_y * Config.SCREEN_HEIGHT
+        
+        return screen_x, screen_y, (roi_x_start, roi_y_start, roi_w, roi_h)
+
 
 # ==============================================================================
-#                           4. GESTURE LOGIC
+#                       4. STATE MACHINE & LOGIC
 # ==============================================================================
-class GestureEngine:
+class CursorController:
     def __init__(self):
-        self.scr_w, self.scr_h = pyautogui.size()
-        self.filter_x = OneEuroFilter(mincutoff=0.01, beta=Config.SMOOTHING)
-        self.filter_y = OneEuroFilter(mincutoff=0.01, beta=Config.SMOOTHING)
+        # Smoothing filters for X and Y
+        self.filter_x = OneEuroFilter(Config.FPS, Config.ONE_EURO_MIN_CUTOFF, Config.ONE_EURO_BETA)
+        self.filter_y = OneEuroFilter(Config.FPS, Config.ONE_EURO_MIN_CUTOFF, Config.ONE_EURO_BETA)
         
         # State
-        self.state = "CALIBRATION" 
-        self.tutorial_step = 0
-        
-        # Hand Data
-        self.r_fingers = [0]*5
-        self.r_pinches = [0]*5
-        self.r_fist = False
-        # Left hand tracking
-        self.l_fingers = [0]*5
-        self.l_pinches = [0]*5
-        self.l_fist = False
-        
-        # Logic vars
-        self.last_click = 0
         self.is_dragging = False
+        self.is_scrolling = False
+        self.pinch_start_time = 0
+        self.last_click_time = 0
         
-        # Zoom vars
-        self.prev_zoom_dist = None
-        
-        # Calibration vars
-        self.calib_start = 0
-        self.calib_ref = None
-        # Scroll helper
-        self.prev_scroll_y = None
-        # Use controller's gesture handlers for navigation (prefer controller)
-        self.use_controller = True
+        # Hysteresis State
+        self.pinch_active = False
 
-    def update_fingers(self, lm, label):
-        """Analyzes hand landmarks."""
-        if label == "Right":
-            thumb = (lm[4].x, lm[4].y)
+    def process_hand(self, hand_landmarks):
+        """
+        Main logic pipeline:
+        1. Extract Landmarks
+        2. Detect Intent (Move, Scroll, Click)
+        3. Apply Physics (Smoothing, Thresholds, Damping)
+        4. Execute Action
+        """
+        # --- 1. Landmarks ---
+        # Thumb(4), Index(8), Middle(12)
+        thumb = hand_landmarks.landmark[4]
+        index = hand_landmarks.landmark[8]
+        middle = hand_landmarks.landmark[12]
+        
+        # "Knuckle" for stable tracking (Index PIP - 6)
+        tracker_node = hand_landmarks.landmark[9] 
+        
+        # --- 2. Pinch Analysis (For Precision Mode) ---
+        dist_pinch = GeometryEngine.get_distance(thumb, index)
+        
+        # --- 3. Geometry & Mapping ---
+        raw_x, raw_y = tracker_node.x, tracker_node.y
+        target_x, target_y, roi_rect = GeometryEngine.map_coordinates(
+            raw_x, raw_y, Config.TILT_ANGLE_DEG
+        )
+        
+        # --- 4. Precision Stabilization (Sniper Mode) ---
+        # If the user is about to click (pinch distance is small), 
+        # we reduce the Beta (responsiveness) to stabilize the cursor.
+        
+        current_beta = Config.ONE_EURO_BETA
+        if dist_pinch < Config.PINCH_STABILIZE_DIST:
+             # Scale beta down based on how close we are to clicking
+             # Closer = slower/smoother
+             factor = max(0.1, (dist_pinch / Config.PINCH_STABILIZE_DIST))
+             current_beta = Config.ONE_EURO_BETA * factor * Config.STABILIZE_FACTOR
+
+        # Apply smoothing with dynamic beta
+        smooth_x = self.filter_x.filter(target_x, custom_beta=current_beta)
+        smooth_y = self.filter_y.filter(target_y, custom_beta=current_beta)
+
+        # --- 5. Gesture Detection ---
+        
+        # A. Scroll Gesture
+        idx_up = index.y < hand_landmarks.landmark[6].y
+        mid_up = middle.y < hand_landmarks.landmark[10].y
+        ring_down = hand_landmarks.landmark[16].y > hand_landmarks.landmark[14].y
+        
+        # Scroll Mode: Index & Middle UP, Ring DOWN
+        if idx_up and mid_up and ring_down:
+            return self._handle_scroll(hand_landmarks, smooth_x, smooth_y)
             
-            # Thumb
-            self.r_fingers[0] = 1 if lm[4].x < lm[3].x else 0
+        self.is_scrolling = False
+        
+        # B. Click / Drag Logic (Index + Thumb Pinch)
+        
+        # Schmitt Trigger (Hysteresis)
+        if not self.pinch_active and dist_pinch < Config.PINCH_DOWN_THRESH:
+            self.pinch_active = True
+            self.pinch_start_time = time.time()
+            # Don't click immediately; wait to see if it's a drag
             
-            # Fingers (Tip vs PIP)
-            for i, tip_id in enumerate([8,12,16,20]):
-                pip_id = tip_id - 2 
-                self.r_fingers[i+1] = 1 if lm[tip_id].y < lm[pip_id].y else 0
-                
-            # Pinches
-            for i, tip_id in enumerate([8,12,16,20]):
-                tip = (lm[tip_id].x, lm[tip_id].y)
-                dist = math.hypot(tip[0]-thumb[0], tip[1]-thumb[1])
-                self.r_pinches[i+1] = 1 if dist < Config.PINCH_THRESH else 0
+        elif self.pinch_active and dist_pinch > Config.PINCH_UP_THRESH:
+            self.pinch_active = False
+            # Release Logic
+            if self.is_dragging:
+                pyautogui.mouseUp()
+                self.is_dragging = False
+            else:
+                # It was a click (short duration)
+                if time.time() - self.pinch_start_time < Config.DRAG_ACTIVATION_TIME:
+                    pyautogui.click()
+        
+        # Drag Holding Logic
+        if self.pinch_active:
+            if not self.is_dragging and (time.time() - self.pinch_start_time > Config.DRAG_ACTIVATION_TIME):
+                pyautogui.mouseDown()
+                self.is_dragging = True
+        
+        # --- 6. Execution ---
+        # Move cursor if not scrolling
+        if not self.is_scrolling:
+            pyautogui.moveTo(smooth_x, smooth_y, duration=0)
             
-            # Fist Detection (Index, Middle, Ring, Pinky all down)
-            fingers_down = sum([1 for f in self.r_fingers[1:] if f == 0]) 
-            self.r_fist = (fingers_down >= 3)
-        elif label == "Left":
-            thumb = (lm[4].x, lm[4].y)
+        return {
+            "pos": (int(smooth_x), int(smooth_y)),
+            "roi": roi_rect,
+            "state": "DRAG" if self.is_dragging else ("PINCH" if self.pinch_active else "MOVE"),
+            "dist": dist_pinch,
+            "beta": current_beta # For debug
+        }
 
-            # Thumb (left hand mirrored)
-            self.l_fingers[0] = 1 if lm[4].x > lm[3].x else 0
-
-            # Fingers (Tip vs PIP)
-            for i, tip_id in enumerate([8,12,16,20]):
-                pip_id = tip_id - 2 
-                self.l_fingers[i+1] = 1 if lm[tip_id].y < lm[pip_id].y else 0
-
-            # Pinches
-            for i, tip_id in enumerate([8,12,16,20]):
-                tip = (lm[tip_id].x, lm[tip_id].y)
-                dist = math.hypot(tip[0]-thumb[0], tip[1]-thumb[1])
-                self.l_pinches[i+1] = 1 if dist < Config.PINCH_THRESH else 0
-
-            # Fist Detection (Index, Middle, Ring, Pinky all down)
-            fingers_down = sum([1 for f in self.l_fingers[1:] if f == 0]) 
-            self.l_fist = (fingers_down >= 3)
-
-    def process_cursor(self, right_lm):
-        """MOVES CURSOR USING KNUCKLE TRACKING (STABLE)."""
-        tracker_node = right_lm[9]  # Middle Finger Knuckle
-
-        # Map Coordinates with Scaling tuned for laptops/flat screens
-        margin = 0.12
-        raw_x = (tracker_node.x - margin) / (1 - 2 * margin)
-        raw_y = (tracker_node.y - margin) / (1 - 2 * margin)
-
-        raw_x = max(0.0, min(1.0, raw_x))
-        raw_y = max(0.0, min(1.0, raw_y))
-
-        # Apply acceleration center-scaling so small hand moves near center
-        raw_x = (raw_x - 0.5) * Config.TRACKING_SCALE + 0.5
-        raw_y = (raw_y - 0.5) * Config.TRACKING_SCALE + 0.5
-
-        raw_x = max(0.0, min(1.0, raw_x))
-        raw_y = max(0.0, min(1.0, raw_y))
-
-        sx = self.filter_x.filter(raw_x * self.scr_w)
-        sy = self.filter_y.filter(raw_y * self.scr_h)
-
-        pyautogui.moveTo(sx, sy, duration=0)
-
-    def process_zoom(self, r_lm, l_lm):
-        """Two Handed Zoom."""
-        dist = math.hypot(r_lm[9].x - l_lm[9].x, r_lm[9].y - l_lm[9].y)
+    def _handle_scroll(self, hand_landmarks, x, y):
         
-        if self.prev_zoom_dist is None:
-            self.prev_zoom_dist = dist
-            return None
-        
-        delta = dist - self.prev_zoom_dist
-        
-        if abs(delta) > Config.ZOOM_STEP:
-            if delta > 0:
-                pyautogui.hotkey('ctrl', '=')
-                self.prev_zoom_dist = dist
-                return "ZOOM IN"
-            else:
-                pyautogui.hotkey('ctrl', '-')
-                self.prev_zoom_dist = dist
-                return "ZOOM OUT"
-        return None
-
-    def run_calibration(self, right_lm):
-        if not right_lm:
-            self.calib_start = 0
-            return "Searching...", "Show Right Hand", Config.UI_WARN, 0.0
-        
-        # Use Knuckle for calibration too
-        curr = (right_lm[9].x, right_lm[9].y)
-        if self.calib_start == 0:
-            self.calib_start = time.time()
-            self.calib_ref = curr
-            return "Calibrating...", "Hold Hand Steady", Config.UI_INFO, 0.1
+        if not self.is_scrolling:
+            self.is_scrolling = True
+            self.scroll_y_origin = hand_landmarks.landmark[9].y
+            return {"pos": (x,y), "state": "SCROLL_READY", "roi": None}
             
-        # FIX: Ensure Config.CALIB_DIST is defined
-        dist = math.hypot(curr[0]-self.calib_ref[0], curr[1]-self.calib_ref[1]) * Config.WIDTH
-        if dist > Config.CALIB_DIST:
-            self.calib_start = time.time()
-            self.calib_ref = curr
-            return "Moving too much!", "Keep Hand Still", Config.UI_WARN, 0.0
-            
-        elapsed = time.time() - self.calib_start
-        prog = min(elapsed / Config.CALIB_TIME, 1.0)
+        curr_y = hand_landmarks.landmark[9].y
+        diff = self.scroll_y_origin - curr_y # Up is negative in MP, positive in scroll
         
-        if elapsed > Config.CALIB_TIME:
-            self.state = "TUTORIAL"
-            return "Success!", "Starting Tutorial...", Config.UI_ACCENT, 1.0
+        if abs(diff) > Config.SCROLL_DEADZONE:
+            # Non-linear scrolling speed
+            speed = int(math.copysign(pow(abs(diff) * Config.SCROLL_SENSITIVITY, 1.5), diff) * 10)
+            pyautogui.scroll(speed)
             
-        return "Calibrating...", f"Hold Steady {(Config.CALIB_TIME-elapsed):.1f}s", Config.UI_INFO, prog
+        return {"pos": (x, y), "state": "SCROLLING", "roi": None, "dist": 0}
 
-    def run_tutorial(self, right_lm, left_lm):
-        # Extended multi-step tutorial for laptop gestures
-        # Steps: 0 Move, 1 Pinch click, 2 Double-click both pinches, 3 Left-fist scroll, 4 Two-hand zoom, 5 Fist-drag
-        if not hasattr(self, 'tutorial_step'):
-            self.tutorial_step = 0
-
-        # Step 0: Move cursor
-        if self.tutorial_step == 0:
-            if right_lm:
-                self.process_cursor(right_lm)
-                if not hasattr(self, 'tut_move_timer'): self.tut_move_timer = time.time()
-                if time.time() - self.tut_move_timer > 2.0:
-                    self.tutorial_step = 1
-            else:
-                self.tut_move_timer = time.time()
-            return "Tutorial 1/6", "Move hand to control cursor", Config.UI_INFO, 1/6
-
-        # Step 1: Pinch index to click
-        if self.tutorial_step == 1:
-            status = "Waiting"
-            if right_lm and self.r_pinches[1]:
-                status = "Pinch Detected"
-                if not hasattr(self, 'tut_pinchtimer'): self.tut_pinchtimer = time.time()
-                if time.time() - self.tut_pinchtimer > 0.5:
-                    self.tutorial_step = 2
-            else:
-                self.tut_pinchtimer = time.time()
-            return "Tutorial 2/6", f"Pinch Index (Right) to Click ({status})", Config.UI_WARN, 2/6
-
-        # Step 2: Both index pinches -> double click
-        if self.tutorial_step == 2:
-            status = "Waiting"
-            if right_lm and left_lm and self.r_pinches[1] and self.l_pinches[1]:
-                status = "Both Pinch"
-                if not hasattr(self, 'tut_bothpinch_timer'): self.tut_bothpinch_timer = time.time()
-                if time.time() - self.tut_bothpinch_timer > 0.5:
-                    self.tutorial_step = 3
-            else:
-                self.tut_bothpinch_timer = time.time()
-            return "Tutorial 3/6", f"Pinch Both Indexes to Double-Click ({status})", Config.UI_ACCENT, 3/6
-
-        # Step 3: Left-fist scroll mode (move right knuckle up/down)
-        if self.tutorial_step == 3:
-            status = "Waiting"
-            if left_lm and self.l_fist and right_lm:
-                status = "Scroll Mode"
-                if not hasattr(self, 'tut_scroll_timer'): self.tut_scroll_timer = time.time()
-                if time.time() - self.tut_scroll_timer > 1.0:
-                    self.tutorial_step = 4
-            else:
-                self.tut_scroll_timer = time.time()
-            return "Tutorial 4/6", f"Make Left Fist + Move Right Knuckle to Scroll ({status})", Config.UI_INFO, 4/6
-
-        # Step 4: Two-hand zoom
-        if self.tutorial_step == 4:
-            status = "Waiting"
-            if right_lm and left_lm:
-                action = self.process_zoom(right_lm, left_lm)
-                if action:
-                    status = action
-                    if not hasattr(self, 'tut_zoom_timer'): self.tut_zoom_timer = time.time()
-                    if time.time() - self.tut_zoom_timer > 0.6:
-                        self.tutorial_step = 5
-                else:
-                    self.tut_zoom_timer = time.time()
-            return "Tutorial 5/6", f"Use Both Hands Knuckles to Zoom ({status})", Config.UI_INFO, 5/6
-
-        # Step 5: Fist drag to move windows
-        if self.tutorial_step == 5:
-            status = "Waiting"
-            if right_lm and self.r_fist:
-                status = "Fist Detected"
-                if not hasattr(self, 'tut_drag_timer'): self.tut_drag_timer = time.time()
-                if time.time() - self.tut_drag_timer > 1.0:
-                    self.state = "ACTIVE"
-                    return "Tutorial Complete", "Entering Active Mode", Config.UI_ACCENT, 1.0
-            else:
-                self.tut_drag_timer = time.time()
-            return "Tutorial 6/6", f"Make Fist (Right) and Move to Drag ({status})", Config.UI_WARN, 6/6
-
-        return "Tutorial", "Follow Instructions", Config.UI_INFO, 0.0
-
-    def run_active(self, right_lm, left_lm):
-        now = time.time()
-        main_txt = "Active"
-        sub_txt = "Tracking Knuckle"
-        col = Config.UI_ACCENT
-
-        # If using controller module, skip internal pyautogui actions
-        if getattr(self, 'use_controller', False):
-            return "Active (Controller)", "Using Controller Gestures", Config.UI_ACCENT, 0.0
-        
-        # 0. ZOOM (Priority)
-        if right_lm and left_lm:
-            zoom_action = self.process_zoom(right_lm, left_lm)
-            if zoom_action:
-                return "ZOOMING", zoom_action, Config.UI_INFO, 0.0
-        else:
-            self.prev_zoom_dist = None
-
-        # Double-click (both index pinched) - high priority to avoid conflicts
-        if right_lm and left_lm and self.r_pinches[1] and self.l_pinches[1]:
-            if now - self.last_click > Config.CLICK_COOLDOWN:
-                pyautogui.doubleClick()
-                self.last_click = now
-                return "DOUBLE CLICK", "Both Index Pinch", Config.UI_ACCENT, 0.0
-
-        # Scroll mode: left hand makes a fist -> use right knuckle vertical movement to scroll
-        if left_lm and self.l_fist and right_lm:
-            ry = right_lm[9].y
-            if self.prev_scroll_y is None:
-                self.prev_scroll_y = ry
-            else:
-                dy = self.prev_scroll_y - ry
-                if abs(dy) > 0.005:
-                    amount = int(dy * Config.SCROLL_SPEED * 10)
-                    if amount != 0:
-                        pyautogui.scroll(amount)
-            self.prev_scroll_y = ry
-            return "SCROLL MODE", "Left Fist + Move", Config.UI_INFO, 0.0
-        else:
-            self.prev_scroll_y = None
-
-        # 1. RIGHT HAND
-        if right_lm:
-            # DRAG (Fist)
-            if self.r_fist:
-                if not self.is_dragging:
-                    try:
-                        pyautogui.mouseDown(button='left')
-                    except TypeError:
-                        pyautogui.mouseDown()
-                    self.is_dragging = True
-                # Move cursor while holding mouse down for reliable dragging
-                self.process_cursor(right_lm)
-                main_txt = "DRAGGING"
-                sub_txt = "Fist Locked"
-                col = Config.UI_WARN
-            else:
-                if self.is_dragging:
-                    try:
-                        pyautogui.mouseUp(button='left')
-                    except TypeError:
-                        pyautogui.mouseUp()
-                    self.is_dragging = False
-                
-                # Move Cursor
-                self.process_cursor(right_lm)
-
-                # CLICKS
-                if now - self.last_click > Config.CLICK_COOLDOWN:
-                    if self.r_pinches[1]:
-                        pyautogui.click()
-                        self.last_click = now
-                        main_txt = "CLICK"
-                        sub_txt = "Left Click"
-                    elif self.r_pinches[2]:
-                        pyautogui.rightClick()
-                        self.last_click = now
-                        main_txt = "R-CLICK"
-                        sub_txt = "Right Click"
-                    elif self.r_pinches[4]:
-                         pyautogui.scroll(-Config.SCROLL_SPEED)
-                         main_txt = "SCROLL"
-                         sub_txt = "Down"
-
-        return main_txt, sub_txt, col, 0.0
 
 # ==============================================================================
-#                               MAIN LOOP
+#                       5. MAIN APPLICATION
 # ==============================================================================
 def main():
-    # Support for external webcams: Try index 0 then 1
-    cam_index = 0
-    cap_test = cv2.VideoCapture(cam_index)
-    if not cap_test.isOpened():
-        cam_index = 1
-    cap_test.release()
-
-    hands = mp.solutions.hands.Hands(
-        model_complexity=0,
-        max_num_hands=2,
+    # 1. Setup
+    cam = ThreadedCamera().start()
+    mp_hands = mp.solutions.hands
+    hands = mp_hands.Hands(
+        max_num_hands=1,
+        model_complexity=1, # 1 is balanced, 0 is fast
         min_detection_confidence=0.7,
         min_tracking_confidence=0.7
     )
-    cam = ThreadedCamera(src=cam_index).start()
-    engine = GestureEngine()
     
-    show_video = False
-    pTime = None
+    controller = CursorController()
     
-    print("Started. Video Hidden. Press 'V' to Toggle Camera.")
-
+    print("[SYSTEM] Gesture Controller Active. Press 'Q' to Quit.")
+    
+    prev_time = 0
+    
     while True:
-        success, raw = cam.read()
+        # 2. Capture
+        success, frame = cam.read()
         if not success: continue
-
-        # GPU Flip
-        try:
-            u_frame = cv2.UMat(raw)
-            u_frame = cv2.flip(u_frame, 1)
-            disp = u_frame.get()
-            rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
-        except:
-            disp = cv2.flip(raw, 1)
-            rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
-
-        # AI
+        
+        # Mirror for intuition
+        frame = cv2.flip(frame, 1)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # 3. Process
         results = hands.process(rgb)
         
-        right_lm = None
-        left_lm = None
+        status = {}
         
         if results.multi_hand_landmarks:
-            # Keep both the Mediapipe landmark objects (for Controller) and lists (for GestureEngine)
-            right_obj = None
-            left_obj = None
-            for lm, h in zip(results.multi_hand_landmarks, results.multi_handedness):
-                lbl = h.classification[0].label
-                engine.update_fingers(lm.landmark, lbl)
-                if lbl == "Right":
-                    right_lm = lm.landmark
-                    right_obj = lm
-                else:
-                    left_lm = lm.landmark
-                    left_obj = lm
-        else:
-            right_obj = None
-            left_obj = None
+            hand_lms = results.multi_hand_landmarks[0]
+            
+            # Core Logic
+            status = controller.process_hand(hand_lms)
+            
+            # --- Visual Debugging ---
+            # Draw ROI Box
+            if "roi" in status and status["roi"]:
+                rx, ry, rw, rh = status["roi"]
+                h, w, _ = frame.shape
+                
+                # Draw the tilted box? No, just draw the regular bounds for reference.
+                # Since we rotate input, the visual box should ideally be rotated, 
+                # but standard rect is fine for reference.
+                cv2.rectangle(frame, 
+                             (int(rx*w), int(ry*h)), 
+                             (int((rx+rw)*w), int((ry+rh)*h)), 
+                             (100, 100, 100), 2)
+            
+            # Draw Skeleton
+            mp.solutions.drawing_utils.draw_landmarks(frame, hand_lms, mp_hands.HAND_CONNECTIONS)
+            
+            # Visual Feedback for States
+            h, w, _ = frame.shape
+            cx, cy = int(hand_lms.landmark[8].x * w), int(hand_lms.landmark[8].y * h)
+            
+            color = Config.COLOR_POINTER
+            if status.get("state") == "PINCH": color = (0, 255, 255)
+            if status.get("state") == "DRAG": color = Config.COLOR_CLICK
+            if status.get("state") == "SCROLLING": color = Config.COLOR_SCROLL
+            
+            cv2.circle(frame, (cx, cy), 10, color, -1)
+            
+            # Show "Sniper Mode" indicator
+            if status.get("beta", 1.0) < Config.ONE_EURO_BETA:
+                cv2.putText(frame, "PRECISION", (cx+20, cy+10), 
+                           cv2.FONT_HERSHEY_PLAIN, 1, (0, 255, 255), 1)
 
-        # Feed Controller with the Mediapipe hand objects
-        Controller.set_hands(left_obj, right_obj)
-        Controller.update_right_hand_status()
-        Controller.update_left_hand_status()
-
-        # STATE
-        if engine.state == "CALIBRATION":
-            t1, t2, col, prog = engine.run_calibration(right_lm)
-        elif engine.state == "TUTORIAL":
-            t1, t2, col, prog = engine.run_tutorial(right_lm, left_lm)
-        elif engine.state == "ACTIVE":
-            # If controller integration is enabled, use Controller handlers
-            if getattr(engine, 'use_controller', False):
-                # Controller reads Mediapipe objects via set_hands above
-                Controller.cursor_moving()
-                Controller.detect_clicking()
-                Controller.detect_zooming()
-                Controller.detect_scrolling()
-                Controller.detect_swipe_gesture()
-                t1, t2, col, prog = "Active (Controller)", "Controller Mode", Config.UI_ACCENT, 0.0
-            else:
-                t1, t2, col, prog = engine.run_active(right_lm, left_lm)
-
-        # RENDER
-        if not show_video:
-            disp = np.zeros((Config.HEIGHT, Config.WIDTH, 3), dtype=np.uint8)
+        # 4. Performance Metrics
+        curr_time = time.time()
+        fps = 1 / (curr_time - prev_time) if prev_time else 0
+        prev_time = curr_time
         
-        cTime = time.time()
-        if pTime is None:
-            fps = 0.0
-        else:
-            dt = cTime - pTime
-            fps = 1.0 / dt if dt > 0 else 0.0
-        pTime = cTime
+        cv2.putText(frame, f"FPS: {int(fps)}", (20, 40), 
+                   cv2.FONT_HERSHEY_PLAIN, 2, (0, 255, 0), 2)
         
-        DynamicIsland.render(disp, t1, t2, col, prog, fps, show_video)
-        
-        if show_video and results.multi_hand_landmarks:
-             for lm in results.multi_hand_landmarks:
-                 mp.solutions.drawing_utils.draw_landmarks(disp, lm, mp.solutions.hands.HAND_CONNECTIONS)
-                 # Visualize the Tracker Point (Knuckle)
-                 if right_lm:
-                     cx, cy = int(right_lm[9].x * Config.WIDTH), int(right_lm[9].y * Config.HEIGHT)
-                     cv2.circle(disp, (cx, cy), 8, Config.UI_ACCENT, -1)
-
-        cv2.imshow("Gesture OS", disp)
-        
-        k = cv2.waitKey(1) & 0xFF
-        if k == ord('q'): break
-        if k == ord('v'): show_video = not show_video
+        cv2.imshow("HyperGesture", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
     cam.release()
     cv2.destroyAllWindows()
 
+
 if __name__ == "__main__":
     main()
-
-
